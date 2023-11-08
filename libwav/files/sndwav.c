@@ -1,4 +1,5 @@
 #include "sndwav.h"
+#include "libwav.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6,92 +7,99 @@
 
 #include <kos/thread.h>
 #include <dc/sound/stream.h>
-#include "libwav.h"
 
 /* Keep track of things from the Driver side */
 #define SNDDRV_STATUS_NULL         0x00
-#define SNDDRV_STATUS_INITIALIZING 0x01
-#define SNDDRV_STATUS_READY        0x02
-#define SNDDRV_STATUS_STREAMING    0x03
-#define SNDDRV_STATUS_DONE         0x04
-#define SNDDRV_STATUS_ERROR        0x05
+#define SNDDRV_STATUS_READY        0x01
+#define SNDDRV_STATUS_DONE         0x02
 
 /* Keep track of things from the Decoder side */
 #define SNDDEC_STATUS_NULL         0x00
-#define SNDDEC_STATUS_INITIALIZING 0x01
-#define SNDDEC_STATUS_READY        0x02
-#define SNDDEC_STATUS_STREAMING    0x03
-#define SNDDEC_STATUS_PAUSING      0x04
-#define SNDDEC_STATUS_PAUSED       0x05
-#define SNDDEC_STATUS_STOPPING     0x06
-#define SNDDEC_STATUS_STOPPED      0x07
-#define SNDDEC_STATUS_RESUMING     0x08
-#define SNDDEC_STATUS_DONE         0x09
-#define SNDDEC_STATUS_ERROR        0x0A
+#define SNDDEC_STATUS_READY        0x01
+#define SNDDEC_STATUS_STREAMING    0x02
+#define SNDDEC_STATUS_PAUSING      0x03
+#define SNDDEC_STATUS_STOPPING     0x04
+#define SNDDEC_STATUS_RESUMING     0x05
 
-/* Keep track of the buffer status from both sides */
-#define SNDDRV_STATUS_NULL         0x00
-#define SNDDRV_STATUS_NEEDBUF      0x01
-#define SNDDRV_STATUS_HAVEBUF      0x02
-#define SNDDRV_STATUS_BUFEND       0x03
+#define STREAM_BUFFER_SIZE 65536
 
-typedef void * (*snddrv_cb)(snd_stream_hnd_t, int, int*);
+typedef void *(*snddrv_cb)(snd_stream_hnd_t, int, int*);
 
-typedef struct
-{
+typedef struct {
+    /* The buffer on the AICA side */
+    snd_stream_hnd_t shnd;
+
+    /* We either read the wav data from a file or 
+       we read from a buffer */
+    FILE *wave_file;
+    const uint8_t *wave_buf;
+
+    /* Contains the buffer that we are going to send
+       to the AICA in the callback.  Should be 32-byte
+       aligned */
+    uint8_t *drv_buf;
+
+    /* Status of the stream that can be started, stopped
+       paused, ready. etc */
+    volatile int status;
+
     snddrv_cb callback;
-    snd_stream_hnd_t shnd; // Stream handler
 
-    int loop;
-    int chan; // Mono or Stereo
-    volatile short status; // Status of stream
-    unsigned int rate; // 44100Hz
-    unsigned short vol; // 0-255
-    
-    unsigned char drv_buf[STREAM_BUFFER_SIZE]; // Buffer
-    
-    FILE* wave_file;
+    uint32_t loop;
+    uint32_t vol;         /* 0-255 */
 
-    const unsigned char* wave_buf;
-    unsigned int buf_offset;
+    uint32_t format;      /* Wave format */
+    uint32_t channels;    /* 1-Mono/2-Stereo */
+    uint32_t sample_rate; /* 44100Hz */
+    uint32_t sample_size; /* 4/8/16-Bit */
 
-    // Offset to the data chunk inside wave_file || wave_buf
-    unsigned int data_offset;
-    unsigned int data_length;
+    /* Offset into the file or buffer where the audio 
+       data starts */
+    uint32_t data_offset;
+
+    /* The length of the audio data */
+    uint32_t data_length;
+
+    /* Used only in reading wav data from a buffer 
+       and not a file */
+    uint32_t buf_offset;  
+   
 } snddrv_hnd;
 
-static volatile int sndwav_status = SNDDRV_STATUS_DONE;
 static snddrv_hnd streams[SND_STREAM_MAX];
+static volatile int sndwav_status = SNDDRV_STATUS_NULL;
 
-static void* sndwav_thread();
-static void* wav_file_callback(snd_stream_hnd_t hnd, int req, int* done);
-static void* wav_buf_callback(snd_stream_hnd_t hnd, int req, int* done);
+static void *sndwav_thread();
+static void *wav_file_callback(snd_stream_hnd_t hnd, int req, int *done);
+static void *wav_buf_callback(snd_stream_hnd_t hnd, int req, int *done);
 
-int wav_init() {
-    if (snd_stream_init() < 0)
+int wav_init(void) {
+    int i;
+
+    if(snd_stream_init() < 0)
 		return 0;
 
-    // Default values
-    for(int i=0;i<SND_STREAM_MAX;i++) {
+    for(i = 0; i < SND_STREAM_MAX; i++) {
         streams[i].shnd = SND_STREAM_INVALID;
         streams[i].vol = 240;
         streams[i].status = SNDDEC_STATUS_NULL;
         streams[i].callback = NULL;
     }
 
-    if (thd_create(0, sndwav_thread, NULL) != NULL) {
-		sndwav_status = SNDDRV_STATUS_READY;
+    if(thd_create(1, sndwav_thread, NULL) != NULL) {
+        sndwav_status = SNDDRV_STATUS_READY;
         return 1;
 	}
     else {
-        sndwav_status = SNDDRV_STATUS_ERROR;
         return 0;
     }
 }
 
-void wav_shutdown() {
+void wav_shutdown(void) {
+    int i;
+
     sndwav_status = SNDDRV_STATUS_DONE;
-    for(int i=0;i<SND_STREAM_MAX;i++) {
+    for(i = 0; i < SND_STREAM_MAX; i++) {
         wav_destroy(i);
     }
 }
@@ -100,36 +108,59 @@ void wav_destroy(wav_stream_hnd_t hnd) {
     if(streams[hnd].shnd == SND_STREAM_INVALID)
         return;
 
-    if(streams[hnd].wave_file != NULL) {
+    if(streams[hnd].wave_file != NULL)
         fclose(streams[hnd].wave_file);
-    } else {
-        //free(wave_buf);
+
+    if(streams[hnd].drv_buf) {
+        free(streams[hnd].drv_buf);
+        streams[hnd].drv_buf = NULL;
     }
 
     snd_stream_stop(streams[hnd].shnd);
     snd_stream_destroy(streams[hnd].shnd);
+    
     streams[hnd].shnd = SND_STREAM_INVALID;
     streams[hnd].vol = 240;
     streams[hnd].status = SNDDEC_STATUS_NULL;
     streams[hnd].callback = NULL;
 }
 
-wav_stream_hnd_t wav_create(const char* filename, int loop) {
-    wav_stream_hnd_t index = snd_stream_alloc(wav_file_callback, SND_STREAM_BUFFER_MAX); // SND_STREAM_BUFFER_MAX/4
+wav_stream_hnd_t wav_create(const char *filename, int loop) {
+    FILE *file;
 
-    if(filename == NULL || index == SND_STREAM_INVALID) {
-        snd_stream_destroy(index);
+    if(filename == NULL)
         return SND_STREAM_INVALID;
-    }
 
-    FILE* file  = fopen(filename, "rb");
-    if(file == NULL) {
-        snd_stream_destroy(index);
-        return SND_STREAM_INVALID;
-    }
+    file = fopen(filename, "rb");
+    
+    return wav_create_fd(file, loop);
+}
 
+wav_stream_hnd_t wav_create_fd(FILE *file, int loop) {
     WavFileInfo info;
+    wav_stream_hnd_t index;
+
+    if(file == NULL)
+        return SND_STREAM_INVALID;
+
+    index = snd_stream_alloc(wav_file_callback, SND_STREAM_BUFFER_MAX); // SND_STREAM_BUFFER_MAX/4
+
+    if(index == SND_STREAM_INVALID) {
+        fclose(file);
+        snd_stream_destroy(index);
+        return SND_STREAM_INVALID;
+    }
+    
     if(!wav_get_info_file(file, &info)) {
+        fclose(file);
+        snd_stream_destroy(index);
+        return SND_STREAM_INVALID;
+    }
+
+    streams[index].drv_buf = memalign(32, SND_STREAM_BUFFER_MAX);
+
+    if(streams[index].drv_buf == NULL) {
+        fclose(file);
         snd_stream_destroy(index);
         return SND_STREAM_INVALID;
     }
@@ -137,55 +168,43 @@ wav_stream_hnd_t wav_create(const char* filename, int loop) {
     streams[index].shnd = index;
     streams[index].wave_file = file;
     streams[index].loop = loop;
-    streams[index].rate = info.sample_rate;
-    streams[index].chan = info.channels;
-    streams[index].data_offset = info.data_offset;
-    streams[index].data_length = info.data_length;
     streams[index].callback = wav_file_callback;
-    streams[index].status = SNDDEC_STATUS_READY;
-    fseek(streams[index].wave_file, streams[index].data_offset, SEEK_SET);
 
+    streams[index].format = info.format;
+    streams[index].channels = info.channels;
+    streams[index].sample_rate = info.sample_rate;
+    streams[index].sample_size = info.sample_size;
+    streams[index].data_length = info.data_length;
+    streams[index].data_offset = info.data_offset;
+    
+    fseek(streams[index].wave_file, streams[index].data_offset, SEEK_SET);
+    streams[index].status = SNDDEC_STATUS_READY;
+    
     return index;
 }
 
-wav_stream_hnd_t wav_create_fd(FILE* file, int loop) {
-    wav_stream_hnd_t index = snd_stream_alloc(wav_file_callback, SND_STREAM_BUFFER_MAX); // SND_STREAM_BUFFER_MAX/4
-
-    if(file == NULL || index == SND_STREAM_INVALID) {
-        snd_stream_destroy(index);
-        return SND_STREAM_INVALID;
-    }
-
+wav_stream_hnd_t wav_create_buf(const uint8_t *buf, int loop) {
     WavFileInfo info;
-    if(!wav_get_info_file(file, &info)) {
+    wav_stream_hnd_t index;
+
+    if(buf == NULL)
+        return SND_STREAM_INVALID;
+
+    index = snd_stream_alloc(wav_file_callback, SND_STREAM_BUFFER_MAX); // SND_STREAM_BUFFER_MAX/4
+
+    if(index == SND_STREAM_INVALID) {
         snd_stream_destroy(index);
         return SND_STREAM_INVALID;
     }
-
-    streams[index].shnd = index;
-    streams[index].wave_file = file;
-    streams[index].loop = loop;
-    streams[index].rate = info.sample_rate;
-    streams[index].chan = info.channels;
-    streams[index].data_offset = info.data_offset;
-    streams[index].data_length = info.data_length;
-    streams[index].callback = wav_file_callback;
-    streams[index].status = SNDDEC_STATUS_READY;
-    fseek(streams[index].wave_file, streams[index].data_offset, SEEK_SET);
-
-    return index;
-}
-
-wav_stream_hnd_t wav_create_buf(const unsigned char* buf, int loop) {
-    wav_stream_hnd_t index = snd_stream_alloc(wav_buf_callback, SND_STREAM_BUFFER_MAX);  // SND_STREAM_BUFFER_MAX/4
-
-    if(buf == NULL || index == SND_STREAM_INVALID) {
-        snd_stream_destroy(index);
-        return SND_STREAM_INVALID;
-    }
-
-    WavFileInfo info;
+    
     if(!wav_get_info_buffer(buf, &info)) {
+        snd_stream_destroy(index);
+        return SND_STREAM_INVALID;
+    }
+
+    streams[index].drv_buf = memalign(32, SND_STREAM_BUFFER_MAX);
+
+    if(streams[index].drv_buf == NULL) {
         snd_stream_destroy(index);
         return SND_STREAM_INVALID;
     }
@@ -193,13 +212,17 @@ wav_stream_hnd_t wav_create_buf(const unsigned char* buf, int loop) {
     streams[index].shnd = index;
     streams[index].wave_buf = buf;
     streams[index].loop = loop;
-    streams[index].rate = info.sample_rate;
-    streams[index].chan = info.channels;
-    streams[index].data_offset = info.data_offset;
-    streams[index].data_length = info.data_length;
     streams[index].callback = wav_buf_callback;
-    streams[index].status = SNDDEC_STATUS_READY;
+
+    streams[index].format = info.format;
+    streams[index].channels = info.channels;
+    streams[index].sample_rate = info.sample_rate;
+    streams[index].sample_size = info.sample_size;
+    streams[index].data_length = info.data_length;
+    streams[index].data_offset = info.data_offset;
+    
     streams[index].buf_offset = info.data_offset;
+    streams[index].status = SNDDEC_STATUS_READY;
 
     return index;
 }
@@ -245,29 +268,30 @@ int wav_isplaying(wav_stream_hnd_t hnd) {
     return streams[hnd].status == SNDDEC_STATUS_STREAMING;
 }
 
-void wav_add_filter(wav_stream_hnd_t hnd, wav_filter filter, void* obj) {
+void wav_add_filter(wav_stream_hnd_t hnd, wav_filter filter, void *obj) {
     snd_stream_filter_add(streams[hnd].shnd, filter, obj);
 }
 
-void wav_remove_filter(wav_stream_hnd_t hnd, wav_filter filter, void* obj) {
+void wav_remove_filter(wav_stream_hnd_t hnd, wav_filter filter, void *obj) {
     snd_stream_filter_remove(streams[hnd].shnd, filter, obj);
 }
 
-static void* sndwav_thread() {
-    
-    while(sndwav_status != SNDDRV_STATUS_DONE && sndwav_status != SNDDRV_STATUS_ERROR) {
-        for(int i=0;i<SND_STREAM_MAX;i++) {
-            int wav_status = streams[i].status;
-            switch(wav_status)
-            {
-                case SNDDEC_STATUS_INITIALIZING:
-                    streams[i].status = SNDDEC_STATUS_READY;
-                    break;
+static void *sndwav_thread() {
+    int i;
+
+    while(sndwav_status != SNDDRV_STATUS_DONE) {
+        for(i = 0; i < SND_STREAM_MAX; i++) {
+            switch(streams[i].status) {
                 case SNDDEC_STATUS_READY:
-                    //
                     break;
                 case SNDDEC_STATUS_RESUMING:
-                    snd_stream_start(streams[i].shnd, streams[i].rate, streams[i].chan-1);
+                    if(streams[i].sample_size == 16) {
+                        snd_stream_start(streams[i].shnd, streams[i].sample_rate, streams[i].channels - 1);
+                    } else if(streams[i].sample_size == 8) {
+                        snd_stream_start_pcm8(streams[i].shnd, streams[i].sample_rate, streams[i].channels - 1);
+                    } else if(streams[i].sample_size == 4) {
+                        snd_stream_start_adpcm(streams[i].shnd, streams[i].sample_rate, streams[i].channels - 1);
+                    }
                     streams[i].status = SNDDEC_STATUS_STREAMING;
                     break;
                 case SNDDEC_STATUS_PAUSING:
@@ -285,19 +309,18 @@ static void* sndwav_thread() {
                     break;
                 case SNDDEC_STATUS_STREAMING:
                     snd_stream_poll(streams[i].shnd);
-                    thd_sleep(50);
+                    thd_sleep(20);
                     break;
             }
         }
     }
-
-    wav_shutdown();
 
     return NULL;
 }
 
 static void *wav_file_callback(snd_stream_hnd_t hnd, int req, int* done) {
     int read = fread(streams[hnd].drv_buf, 1, req, streams[hnd].wave_file);
+
     if(read != req) {
         fseek(streams[hnd].wave_file, streams[hnd].data_offset, SEEK_SET);
         if(streams[hnd].loop) {

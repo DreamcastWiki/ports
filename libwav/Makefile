@@ -2,7 +2,7 @@
 PORTNAME =		libwav
 PORTVERSION =	1.0 
 
-MAINTAINER =	Andress Barajas
+MAINTAINER =	Andy Barajas
 LICENSE =		Public Domain
 SHORT_DESC =	Library for decoding WAV file headers 
 
